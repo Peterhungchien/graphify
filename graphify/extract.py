@@ -9818,6 +9818,23 @@ def extract_bash(path: Path) -> dict:
                             if tgt_nid:
                                 add_edge(file_nid, tgt_nid, "imports", line,
                                          context="import")
+                elif cmd == "Rscript":
+                    # Rscript [flags] script.R [args] → link to the R file node
+                    args = [c for c in node.children
+                            if c.type in ("word", "string", "concatenation")
+                            and c != cmd_name_node]
+                    line = node.start_point[0] + 1
+                    for arg in args:
+                        raw = literal(arg) or ""
+                        if raw.startswith("--"):
+                            continue  # skip flags like --vanilla, --no-save
+                        if raw.endswith((".R", ".r")):
+                            resolved = (path.parent / raw).resolve()
+                            if resolved.exists():
+                                tgt_nid = _make_id(str(resolved))
+                                add_edge(file_nid, tgt_nid, "imports_from", line,
+                                         context="import")
+                            break
             return
 
         if t == "declaration_command":
