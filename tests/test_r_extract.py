@@ -139,6 +139,53 @@ f <- function(df) {
     assert "error" not in r
 
 
+# ── box::use() support ──────────────────────────────────────────────────────
+
+def test_box_use_package(tmp_path):
+    r = extract_r(_write_r(tmp_path, "box::use(arrow)"))
+    pkg_nodes = [n for n in r["nodes"] if "arrow" in n["label"]]
+    assert len(pkg_nodes) == 1
+    assert len(_edges_of(r, "imports")) == 1
+
+def test_box_use_package_with_functions(tmp_path):
+    r = extract_r(_write_r(tmp_path, "box::use(dplyr[filter, mutate, select])"))
+    pkg_nodes = [n for n in r["nodes"] if "dplyr" in n["label"]]
+    assert len(pkg_nodes) == 1
+    assert len(_edges_of(r, "imports")) == 1
+
+def test_box_use_relative_path(tmp_path):
+    target = tmp_path / "config.R"
+    target.write_text("x <- 1")
+    r = extract_r(_write_r(tmp_path, "box::use(./config)"))
+    assert len(_edges_of(r, "imports_from")) == 1
+
+def test_box_use_nested_relative_path(tmp_path):
+    (tmp_path / "helpers").mkdir()
+    target = tmp_path / "helpers" / "utils.R"
+    target.write_text("helper <- function() {}")
+    r = extract_r(_write_r(tmp_path, "box::use(./helpers/utils)"))
+    assert len(_edges_of(r, "imports_from")) == 1
+
+def test_box_use_alias(tmp_path):
+    target = tmp_path / "utils.R"
+    target.write_text("f <- function() {}")
+    r = extract_r(_write_r(tmp_path, "box::use(u = ./utils)"))
+    assert len(_edges_of(r, "imports_from")) == 1
+
+def test_box_use_mixed(tmp_path):
+    target = tmp_path / "config.R"
+    target.write_text("x <- 1")
+    r = extract_r(_write_r(tmp_path, """
+box::use(
+  dplyr[filter, mutate],
+  arrow,
+  ./config
+)
+"""))
+    assert len(_edges_of(r, "imports")) == 2       # dplyr + arrow
+    assert len(_edges_of(r, "imports_from")) == 1  # ./config
+
+
 # ── extract_bash() Rscript integration ──────────────────────────────────────
 
 def test_bash_rscript_links_to_r_file(tmp_path):

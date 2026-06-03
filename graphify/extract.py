@@ -9549,6 +9549,99 @@ def extract_r(path: Path) -> dict:
                                 return txt(sub)
         return None
 
+    def _box_path_from_node(node) -> str | None:
+        """Reconstruct a box module path string from its AST node.
+
+        box::use() uses non-standard evaluation so paths like ./helpers/utils
+        are parsed by tree-sitter-r as left-recursive binary_operator chains:
+          binary_operator(binary_operator(., /, helpers), /, utils)
+        This function walks that chain and returns the path string, or None if
+        the node doesn't look like a path expression.
+        """
+        if node.type == "identifier":
+            return txt(node)
+        if node.type == "binary_operator":
+            children = node.children
+            # Expect: left / right  (with '/' as the operator)
+            ops = [c for c in children if not c.is_named]
+            if not any(txt(o) == "/" for o in ops):
+                return None
+            named = [c for c in children if c.is_named]
+            if len(named) < 2:
+                return None
+            left = _box_path_from_node(named[0])
+            right = _box_path_from_node(named[1])
+            if left is not None and right is not None:
+                return f"{left}/{right}"
+        return None
+
+    def _handle_box_use(call_node, line: int) -> None:
+        """Emit import edges for a box::use(...) call.
+
+        Three argument forms:
+          pkg                   → imports edge to a package node
+          pkg[fn1, fn2, ...]    → imports edge to a package node
+          ./rel/path            → imports_from edge to the resolved .R file
+          alias = ./rel/path    → imports_from edge (alias used as label)
+        """
+        for child in call_node.children:
+            if child.type != "arguments":
+                continue
+            for arg in child.children:
+                if arg.type != "argument":
+                    continue
+
+                # Unwrap named argument (alias = <expr>): use the value node
+                arg_children = [c for c in arg.children if c.is_named]
+                # Named arg: first named child is the alias identifier, last is value
+                if len(arg_children) >= 2 and arg_children[0].type == "identifier":
+                    # e.g. utils = ./helpers/utils — skip alias, use value
+                    value_node = arg_children[-1]
+                else:
+                    value_node = arg_children[0] if arg_children else None
+
+                if value_node is None:
+                    continue
+
+                # Case 1: binary_operator chain — relative path import (./...)
+                if value_node.type == "binary_operator":
+                    rel = _box_path_from_node(value_node)
+                    if rel and rel.startswith("."):
+                        # Try with and without .R extension
+                        for suffix in (".R", ".r", ""):
+                            candidate = (path.parent / (rel + suffix)).resolve()
+                            if candidate.exists() and candidate.suffix in (".R", ".r"):
+                                tgt_nid = _make_id(str(candidate))
+                                add_edge(file_nid, tgt_nid, "imports_from", line,
+                                         context="import")
+                                break
+                        else:
+                            tgt_nid = _make_id(rel)
+                            if tgt_nid:
+                                add_edge(file_nid, tgt_nid, "imports", line,
+                                         context="import")
+                    continue
+
+                # Case 2: subset node — pkg[fn1, fn2, ...]
+                if value_node.type == "subset":
+                    pkg_node = next(
+                        (c for c in value_node.children if c.type == "identifier"),
+                        None,
+                    )
+                    if pkg_node:
+                        pkg = txt(pkg_node)
+                        tgt_nid = _make_id(f"pkg_{pkg}")
+                        add_node(tgt_nid, f"box::use({pkg})", line)
+                        add_edge(file_nid, tgt_nid, "imports", line, context="import")
+                    continue
+
+                # Case 3: bare identifier — package name
+                if value_node.type == "identifier":
+                    pkg = txt(value_node)
+                    tgt_nid = _make_id(f"pkg_{pkg}")
+                    add_node(tgt_nid, f"box::use({pkg})", line)
+                    add_edge(file_nid, tgt_nid, "imports", line, context="import")
+
     def walk(node, scope_nid: str) -> None:
         t = node.type
 
@@ -9606,9 +9699,12 @@ def extract_r(path: Path) -> dict:
                 ids = [c for c in callee.children if c.type == "identifier"]
                 if len(ids) >= 2:
                     pkg_name, fn_name2 = txt(ids[0]), txt(ids[1])
-                    tgt_nid = _make_id(f"pkg_{pkg_name}", fn_name2)
-                    add_node(tgt_nid, f"{pkg_name}::{fn_name2}()", line)
-                    add_edge(scope_nid, tgt_nid, "calls", line, context="call")
+                    if pkg_name == "box" and fn_name2 == "use":
+                        _handle_box_use(node, line)
+                    else:
+                        tgt_nid = _make_id(f"pkg_{pkg_name}", fn_name2)
+                        add_node(tgt_nid, f"{pkg_name}::{fn_name2}()", line)
+                        add_edge(scope_nid, tgt_nid, "calls", line, context="call")
             return
 
         for child in node.children:
