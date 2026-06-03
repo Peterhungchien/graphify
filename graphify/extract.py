@@ -9364,6 +9364,283 @@ def _check_tree_sitter_version() -> None:
         )
 
 
+# ── R (tree-sitter compiled at runtime) ─────────────────────────────────────
+
+_R_LANG_CACHE: Any = None
+
+
+def _load_r_language():
+    """Return a tree_sitter.Language for R, compiling from source on first call.
+
+    Requires git and cc on PATH. Grammar is cached at
+    ~/.cache/graphify/grammars/tree_sitter_r.so after the first build.
+    """
+    global _R_LANG_CACHE
+    if _R_LANG_CACHE is not None:
+        return _R_LANG_CACHE
+
+    import ctypes
+    import subprocess
+    from tree_sitter import Language
+
+    cache_dir = Path.home() / ".cache" / "graphify" / "grammars"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    so_path = cache_dir / "tree_sitter_r.so"
+
+    if not so_path.exists():
+        grammar_dir = cache_dir / "tree-sitter-r"
+        if not grammar_dir.exists():
+            subprocess.run(
+                ["git", "clone", "--depth=1",
+                 "https://github.com/r-lib/tree-sitter-r.git",
+                 str(grammar_dir)],
+                check=True,
+                capture_output=True,
+            )
+        src_files = [str(grammar_dir / "src" / "parser.c")]
+        scanner = grammar_dir / "src" / "scanner.c"
+        if scanner.exists():
+            src_files.append(str(scanner))
+        subprocess.run(
+            ["cc", "-shared", "-fPIC", "-o", str(so_path),
+             "-I", str(grammar_dir / "src")] + src_files,
+            check=True,
+            capture_output=True,
+        )
+
+    lib = ctypes.CDLL(str(so_path))
+    lib.tree_sitter_r.restype = ctypes.c_void_p
+    lang_ptr = lib.tree_sitter_r()
+    # Wrap the raw TSLanguage* pointer in a PyCapsule so Language() accepts it
+    # without the deprecation warning raised by passing a plain int.
+    PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+    PyCapsule_New.restype = ctypes.py_object
+    PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    capsule = PyCapsule_New(lang_ptr, b"tree_sitter.Language", None)
+    _R_LANG_CACHE = Language(capsule)
+    return _R_LANG_CACHE
+
+
+def extract_r(path: Path) -> dict:
+    """Extract functions, source/library imports, and calls from .R/.r files."""
+    try:
+        from tree_sitter import Parser
+        language = _load_r_language()
+        parser = Parser(language)
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    try:
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    stem = _file_stem(path)
+    str_path = str(path)
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    seen_ids: set[str] = set()
+    function_bodies: list[tuple[str, Any]] = []
+    defined_functions: set[str] = set()
+
+    def txt(node) -> str:
+        return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+
+    def add_node(nid: str, label: str, line: int) -> None:
+        if nid and nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    def add_edge(src: str, tgt: str, relation: str, line: int,
+                 confidence: str = "EXTRACTED", weight: float = 1.0,
+                 context: str | None = None) -> None:
+        if not src or not tgt or src == tgt:
+            return
+        edge = {"source": src, "target": tgt, "relation": relation,
+                "confidence": confidence, "source_file": str_path,
+                "source_location": f"L{line}", "weight": weight}
+        if context:
+            edge["context"] = context
+        edges.append(edge)
+
+    file_nid = _make_id(str(path))
+    add_node(file_nid, path.name, 1)
+
+    _R_SOURCE_FNS = frozenset({"source", "sys.source"})
+    _R_LIBRARY_FNS = frozenset({"library", "require", "loadNamespace"})
+
+    def _get_assigned_name(fn_def_node) -> str | None:
+        """Return the name identifier for a function_definition.
+
+        Handles two R assignment forms:
+          Left-assign:  my_func <- function(...) { body }
+            → parent is binary_operator(<-), name is parent.children[0]
+          Right-assign: function(...) { body } -> my_func
+            → last child of fn_def_node is binary_operator(->), name is its last child
+        """
+        parent = fn_def_node.parent
+        # Left-assign: parent is binary_operator with <- or =
+        if parent is not None and parent.type == "binary_operator":
+            for child in parent.children:
+                op_txt = txt(child).strip()
+                if op_txt in ("<-", "<<-", "="):
+                    name_node = parent.children[0] if parent.children else None
+                    if name_node and name_node.type == "identifier":
+                        return txt(name_node)
+                    break
+
+        # Right-assign: last child of fn_def_node is binary_operator(->)
+        # tree-sitter-r parses `function(x){body} -> name` as:
+        #   function_definition → [ function, parameters, binary_operator(braced_expr, ->, identifier) ]
+        if fn_def_node.children:
+            last = fn_def_node.children[-1]
+            if last.type == "binary_operator":
+                op_txt_inner = None
+                for child in last.children:
+                    t2 = txt(child).strip()
+                    if t2 in ("->", "->>"):
+                        op_txt_inner = t2
+                        break
+                if op_txt_inner is not None:
+                    name_node = last.children[-1] if last.children else None
+                    if name_node and name_node.type == "identifier":
+                        return txt(name_node)
+        return None
+
+    def _get_function_body(fn_def_node):
+        """Return the braced_expression body node for a function_definition."""
+        # Left-assign: braced_expression is a direct child
+        for child in fn_def_node.children:
+            if child.type == "braced_expression":
+                return child
+        # Right-assign: braced_expression is inside the last child (binary_operator)
+        if fn_def_node.children:
+            last = fn_def_node.children[-1]
+            if last.type == "binary_operator":
+                for child in last.children:
+                    if child.type == "braced_expression":
+                        return child
+        return None
+
+    def _first_string_arg(call_node) -> str | None:
+        for child in call_node.children:
+            if child.type == "arguments":
+                for arg in child.children:
+                    if arg.type == "string":
+                        return txt(arg).strip("'\"")
+                    if arg.type == "argument":
+                        for sub in arg.children:
+                            if sub.type == "string":
+                                return txt(sub).strip("'\"")
+        return None
+
+    def _first_name_arg(call_node) -> str | None:
+        for child in call_node.children:
+            if child.type == "arguments":
+                for arg in child.children:
+                    if arg.type == "identifier":
+                        return txt(arg)
+                    if arg.type == "argument":
+                        for sub in arg.children:
+                            if sub.type == "identifier":
+                                return txt(sub)
+        return None
+
+    def walk(node, scope_nid: str) -> None:
+        t = node.type
+
+        if t == "function_definition":
+            name = _get_assigned_name(node)
+            if name:
+                fn_nid = _make_id(stem, name)
+                line = node.start_point[0] + 1
+                add_node(fn_nid, f"{name}()", line)
+                add_edge(file_nid, fn_nid, "contains", line)
+                defined_functions.add(name)
+                body = _get_function_body(node)
+                function_bodies.append((fn_nid, body))
+                if body is not None:
+                    for child in body.children:
+                        walk(child, fn_nid)
+            return
+
+        if t == "call":
+            line = node.start_point[0] + 1
+            callee = node.children[0] if node.children else None
+            if callee is None:
+                return
+
+            if callee.type == "identifier":
+                fn_name = txt(callee)
+
+                if fn_name in _R_SOURCE_FNS:
+                    raw = _first_string_arg(node)
+                    if raw and raw.endswith((".R", ".r")):
+                        resolved = (path.parent / raw).resolve()
+                        if resolved.exists():
+                            tgt_nid = _make_id(str(resolved))
+                            add_edge(file_nid, tgt_nid, "imports_from", line,
+                                     context="import")
+                        else:
+                            tgt_nid = _make_id(raw)
+                            if tgt_nid:
+                                add_edge(file_nid, tgt_nid, "imports", line,
+                                         context="import")
+                    return
+
+                if fn_name in _R_LIBRARY_FNS:
+                    pkg = _first_name_arg(node) or _first_string_arg(node)
+                    if pkg:
+                        tgt_nid = _make_id(f"pkg_{pkg}")
+                        add_node(tgt_nid, f"library({pkg})", line)
+                        add_edge(file_nid, tgt_nid, "imports", line,
+                                 context="import")
+                    return
+
+                return  # regular call — handled in Phase 2 by walk_calls
+
+            if callee.type == "namespace_operator":
+                ids = [c for c in callee.children if c.type == "identifier"]
+                if len(ids) >= 2:
+                    pkg_name, fn_name2 = txt(ids[0]), txt(ids[1])
+                    tgt_nid = _make_id(f"pkg_{pkg_name}", fn_name2)
+                    add_node(tgt_nid, f"{pkg_name}::{fn_name2}()", line)
+                    add_edge(scope_nid, tgt_nid, "calls", line, context="call")
+            return
+
+        for child in node.children:
+            walk(child, scope_nid)
+
+    walk(root, file_nid)
+
+    def walk_calls(node, func_nid: str, seen_calls: set) -> None:
+        if node is None:
+            return
+        for child in node.children:
+            if child.type == "function_definition":
+                continue
+            if child.type == "call":
+                callee = child.children[0] if child.children else None
+                if callee and callee.type == "identifier":
+                    name = txt(callee)
+                    if name in defined_functions:
+                        tgt = _make_id(stem, name)
+                        key = (func_nid, tgt)
+                        if tgt and key not in seen_calls:
+                            seen_calls.add(key)
+                            add_edge(func_nid, tgt, "calls",
+                                     child.start_point[0] + 1, context="call")
+            walk_calls(child, func_nid, seen_calls)
+
+    for fn_nid, body in function_bodies:
+        walk_calls(body, fn_nid, set())
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_bash(path: Path) -> dict:
     """Extract functions, source imports, and cross-function calls from a .sh file."""
     try:
@@ -10607,6 +10884,8 @@ _DISPATCH: dict[str, Any] = {
     ".dfm": extract_delphi_form,
     ".lfm": extract_lazarus_form,
     ".lpk": extract_lazarus_package,
+    ".r": extract_r,
+    ".R": extract_r,
     ".sh": extract_bash,
     ".bash": extract_bash,
     ".json": extract_json,
