@@ -40,6 +40,22 @@ _LANGUAGE_BUILTIN_GLOBALS: frozenset[str] = frozenset({
     "print", "open", "isinstance", "type", "super", "sorted", "reversed",
     "any", "all", "abs", "round", "next", "iter", "hash", "id", "repr",
     "callable", "getattr", "setattr", "hasattr", "delattr", "vars", "dir",
+    # R built-in functions and common data.table/dplyr names
+    "c", "list", "data.frame", "matrix", "vector", "array",
+    "cat", "paste", "paste0", "sprintf", "format", "formatC",
+    "ifelse", "switch", "match", "which", "seq", "seq_along", "seq_len",
+    "is.na", "is.null", "is.numeric", "is.character", "is.logical",
+    "as.numeric", "as.character", "as.integer", "as.logical", "as.Date",
+    "nrow", "ncol", "length", "dim", "names", "colnames", "rownames",
+    "head", "tail", "unique", "duplicated", "rev", "order", "sort",
+    "lapply", "sapply", "vapply", "mapply", "do.call", "Reduce",
+    "Sys.time", "Sys.getenv", "Sys.setenv", "message", "warning", "stop",
+    "tryCatch", "withCallingHandlers", "on.exit",
+    "file.path", "file.exists", "dir.create", "basename", "dirname",
+    "readLines", "writeLines", "readRDS", "saveRDS",
+    "options", "getOption", "setwd", "getwd",
+    "data.table", "setDT", "setkey", "setkeyv", "setnames",
+    "setcolorder", "setorderv", "copy", "rbindlist", "fread", "fwrite",
 })
 
 
