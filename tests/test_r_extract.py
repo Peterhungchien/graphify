@@ -80,6 +80,11 @@ def test_source_import(tmp_path):
     r = extract_r(_write_r(tmp_path, 'source("helper.R")'))
     assert len(_edges_of(r, "imports_from")) == 1
 
+def test_source_import_fallback_when_file_missing(tmp_path):
+    """source() to a non-existent file should emit an 'imports' edge, not nothing."""
+    r = extract_r(_write_r(tmp_path, 'source("nonexistent.R")'))
+    assert len(_edges_of(r, "imports")) == 1
+
 
 def test_library_import(tmp_path):
     r = extract_r(_write_r(tmp_path, "library(data.table)"))
@@ -129,6 +134,21 @@ f <- function(dt) {
     assert "error" not in r
     assert "f()" in _labels(r)
 
+
+def test_wrapped_library_import(tmp_path):
+    """library() inside suppressPackageStartupMessages() must still produce an import edge."""
+    r = extract_r(_write_r(tmp_path, "suppressPackageStartupMessages(library(data.table))"))
+    assert "error" not in r
+    pkg_nodes = [n for n in r["nodes"] if "data.table" in n["label"]]
+    assert len(pkg_nodes) == 1
+
+def test_wrapped_source_import(tmp_path):
+    """source() inside tryCatch() must still produce an import edge."""
+    target = tmp_path / "helpers.R"
+    target.write_text("f <- function() {}")
+    r = extract_r(_write_r(tmp_path, 'tryCatch(source("helpers.R"), error = function(e) {})'))
+    assert "error" not in r
+    assert len(_edges_of(r, "imports_from")) == 1
 
 def test_pipe_operator_no_crash(tmp_path):
     r = extract_r(_write_r(tmp_path, """
@@ -187,6 +207,16 @@ box::use(
 
 
 # ── extract_bash() Rscript integration ──────────────────────────────────────
+
+def test_bash_rscript_fallback_when_file_missing(tmp_path):
+    """Rscript invocation pointing to a non-existent file emits an 'imports' fallback edge."""
+    from graphify.extract import extract_bash
+    sh_file = tmp_path / "run.sh"
+    sh_file.write_text("#!/bin/bash\nRscript --vanilla missing_script.R\n")
+    r = extract_bash(sh_file)
+    assert "error" not in r
+    import_edges = [e for e in r["edges"] if e["relation"] == "imports"]
+    assert any("missing_script" in e["target"] for e in import_edges)
 
 def test_bash_rscript_links_to_r_file(tmp_path):
     from graphify.extract import extract_bash

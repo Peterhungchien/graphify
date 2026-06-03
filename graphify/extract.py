@@ -9367,6 +9367,8 @@ def _check_tree_sitter_version() -> None:
 # ── R (tree-sitter compiled at runtime) ─────────────────────────────────────
 
 _R_LANG_CACHE: Any = None
+_R_SOURCE_FNS: frozenset[str] = frozenset({"source", "sys.source"})
+_R_LIBRARY_FNS: frozenset[str] = frozenset({"library", "require", "loadNamespace"})
 
 
 def _load_r_language():
@@ -9388,25 +9390,44 @@ def _load_r_language():
     so_path = cache_dir / "tree_sitter_r.so"
 
     if not so_path.exists():
+        import shutil
+        import tempfile
+
         grammar_dir = cache_dir / "tree-sitter-r"
         if not grammar_dir.exists():
+            # Clone into a temp dir then rename so parallel workers don't race
+            # on the same destination path.
+            tmp = Path(tempfile.mkdtemp(dir=cache_dir, prefix=".ts-r-"))
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth=1",
+                     "https://github.com/r-lib/tree-sitter-r.git", str(tmp)],
+                    check=True,
+                    capture_output=True,
+                )
+                tmp.rename(grammar_dir)  # atomic on POSIX
+            except OSError:
+                if not grammar_dir.exists():
+                    raise  # genuine failure, not a race
+                # Another worker won the rename race — grammar_dir is ready
+            finally:
+                if tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+
+        # Re-check: another worker may have compiled while we were cloning
+        if not so_path.exists():
+            src_files = [str(grammar_dir / "src" / "parser.c")]
+            scanner = grammar_dir / "src" / "scanner.c"
+            if scanner.exists():
+                src_files.append(str(scanner))
+            partial = so_path.with_suffix(".so.partial")
             subprocess.run(
-                ["git", "clone", "--depth=1",
-                 "https://github.com/r-lib/tree-sitter-r.git",
-                 str(grammar_dir)],
+                ["cc", "-shared", "-fPIC", "-o", str(partial),
+                 "-I", str(grammar_dir / "src")] + src_files,
                 check=True,
                 capture_output=True,
             )
-        src_files = [str(grammar_dir / "src" / "parser.c")]
-        scanner = grammar_dir / "src" / "scanner.c"
-        if scanner.exists():
-            src_files.append(str(scanner))
-        subprocess.run(
-            ["cc", "-shared", "-fPIC", "-o", str(so_path),
-             "-I", str(grammar_dir / "src")] + src_files,
-            check=True,
-            capture_output=True,
-        )
+            os.replace(partial, so_path)  # atomic rename, no torn reads
 
     lib = ctypes.CDLL(str(so_path))
     lib.tree_sitter_r.restype = ctypes.c_void_p
@@ -9469,8 +9490,6 @@ def extract_r(path: Path) -> dict:
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
-    _R_SOURCE_FNS = frozenset({"source", "sys.source"})
-    _R_LIBRARY_FNS = frozenset({"library", "require", "loadNamespace"})
 
     def _get_assigned_name(fn_def_node) -> str | None:
         """Return the name identifier for a function_definition.
@@ -9608,9 +9627,9 @@ def extract_r(path: Path) -> dict:
                     rel = _box_path_from_node(value_node)
                     if rel and rel.startswith("."):
                         # Try with and without .R extension
-                        for suffix in (".R", ".r", ""):
+                        for suffix in (".R", ".r"):
                             candidate = (path.parent / (rel + suffix)).resolve()
-                            if candidate.exists() and candidate.suffix in (".R", ".r"):
+                            if candidate.exists():
                                 tgt_nid = _make_id(str(candidate))
                                 add_edge(file_nid, tgt_nid, "imports_from", line,
                                          context="import")
@@ -9693,7 +9712,12 @@ def extract_r(path: Path) -> dict:
                                  context="import")
                     return
 
-                return  # regular call — handled in Phase 2 by walk_calls
+                # Not a recognised import — recurse into arguments so that
+                # wrapped imports like suppressPackageStartupMessages(library(x))
+                # and tryCatch(source("f.R"), ...) are still detected.
+                for child in node.children:
+                    walk(child, scope_nid)
+                return
 
             if callee.type == "namespace_operator":
                 ids = [c for c in callee.children if c.type == "identifier"]
@@ -9930,6 +9954,11 @@ def extract_bash(path: Path) -> dict:
                                 tgt_nid = _make_id(str(resolved))
                                 add_edge(file_nid, tgt_nid, "imports_from", line,
                                          context="import")
+                            else:
+                                tgt_nid = _make_id(raw)
+                                if tgt_nid:
+                                    add_edge(file_nid, tgt_nid, "imports", line,
+                                             context="import")
                             break
             return
 
